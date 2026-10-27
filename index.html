@@ -1,0 +1,642 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Investor Tower</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #07060d; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; image-rendering: pixelated; image-rendering: crisp-edges; }
+</style>
+</head>
+<body>
+<canvas id="c" width="320" height="180"></canvas>
+<script>
+"use strict";
+
+// ---------- constants ----------
+const W = 320, H = 180;
+const FH = 48;            // floor height (px)
+const TOP = 30;           // top floor = $1M
+const BASE = -2;          // basement bottom floor = $0
+const WORK_TOP = 15;      // career ceiling: no platforms above this floor
+const GAME_TIME = 600;    // seconds from age 20 to 65
+const TOL = 8;            // max misalignment (px) for an elevator door to open
+const PW = 6, PH = 12;    // player size
+const GRAV = 600, JUMP_V = 170, RUN = 60, MAX_FALL = 300;
+const CAB_IN = 42;        // cabin interior height
+
+// World coordinates: x to the right, y up, floor f surface at y = f * FH.
+const COLS = [
+  { id: "btc",  name: "BTC",    title: "BITCOIN",     x: 12,  w: 40, bottom: 0,
+    main: "#e08a1e", dark: "#8f520c", light: "#ffc266" },
+  { id: "sp",   name: "SP500",  title: "S&P 500",     x: 72,  w: 40, bottom: 0,
+    main: "#3b6fb6", dark: "#22406e", light: "#8fb6ee" },
+  { id: "work", name: "WORK",   title: "WORK",        x: 132, w: 56, bottom: BASE },
+  { id: "fiat", name: "FIAT",   title: "FIAT",        x: 208, w: 40, bottom: BASE,
+    main: "#3f8f4f", dark: "#245a30", light: "#8fd69c" },
+  { id: "immo", name: "HOUSE",  title: "REAL ESTATE", x: 268, w: 40, bottom: 0,
+    main: "#9a5b3a", dark: "#5e3521", light: "#e0a37c" },
+];
+const WORK = 2;
+const ELEV = [0, 1, 3, 4];
+
+// Speeds in floors per second. Volatile markets switch between up and down phases.
+const MARKET = {
+  fiat: { drift: -0.05 },
+  immo: { drift: 0.04 },
+  sp:  { pUp: 0.68, up: 0.12, down: 0.18, crashP: 0.04, crash: 0.4 },
+  btc: { pUp: 0.58, up: 0.36, down: 0.54, crashP: 0.08, crash: 1.2 },
+};
+const KNOCKS = { immo: 5 };
+const EJECT = { btc: "REKT!", sp: "MARGIN CALL", fiat: "INFLATION ATE IT", immo: "FORECLOSED" };
+const OUCH = ["OUCH!", "LAID OFF", "INJURED", "RESTRUCTURED", "BURNOUT"];
+
+const mod = (a, n) => ((a % n) + n) % n;
+const rand = (a, b) => a + Math.random() * (b - a);
+function mulberry32(a) {
+  return () => {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- money ----------
+function moneyAt(y) {
+  const h = y / FH;
+  if (h <= 0) return Math.max(0, 100 * (h - BASE) / -BASE);
+  return Math.min(1e6, 100 * Math.pow(10, 4 * h / TOP));
+}
+function fmtMoney(m) {
+  if (m >= 999999.5) return "$1.00M";
+  if (m >= 1e4) return "$" + Math.floor(m / 1000) + "K";
+  if (m >= 1000) return "$" + (Math.floor(m / 100) / 10).toFixed(1) + "K";
+  return "$" + Math.floor(m);
+}
+
+// ---------- static level ----------
+const SOLIDS = [];
+function solid(x, y, w, h) { SOLIDS.push({ x, y, w, h }); }
+solid(-50, -5000, 62, 10000);                 // outer walls
+solid(308, -5000, 62, 10000);
+for (const i of ELEV) solid(COLS[i].x, -5000, COLS[i].w, 10000); // shafts: entered only through doors
+solid(12, -5000, 120, 5000);                  // ground left of the basement
+solid(208, -5000, 100, 5000);                 // ground right of the basement
+solid(132, -5000, 76, 5000 + BASE * FH);      // basement floor
+const LANDINGS = [];
+for (let a = 0; a < COLS.length - 1; a++) {
+  const l = { a, x: COLS[a].x + COLS[a].w, w: COLS[a + 1].x - COLS[a].x - COLS[a].w,
+    fmin: Math.max(COLS[a].bottom, COLS[a + 1].bottom) };
+  LANDINGS.push(l);
+  for (let f = l.fmin; f <= TOP; f++) solid(l.x, f * FH - 4, l.w, 4);
+}
+solid(12, (TOP + 1) * FH - 4, 296, 400);      // roof
+
+function landingRange(a) { // landing between COLS[a] and COLS[a + 1]
+  return a < 0 || a >= LANDINGS.length ? null : [LANDINGS[a].fmin, TOP];
+}
+
+// One-way platforms of the Work column (ledges, platforms, hallways above the career ceiling).
+function buildPlatforms() {
+  const rnd = mulberry32(20261027);
+  const list = [];
+  for (let f = BASE + 1; f < WORK_TOP; f++) {
+    if (f >= 0) list.push({ x: 132, y: f * FH, w: 6 });
+    list.push({ x: 182, y: f * FH, w: 6 });
+  }
+  for (let f = WORK_TOP; f <= TOP; f++) list.push({ x: 132, y: f * FH, w: 56, hall: true });
+  let left = true;
+  for (let f = BASE; f < WORK_TOP; f++) {
+    const t = (f - BASE) / (WORK_TOP - BASE);
+    const w = Math.round(18 - 9 * t);
+    for (const dy of [16, 32]) {
+      const x = Math.round((left ? 139 : 160) + rnd() * (21 - w));
+      const crumble = f >= 2 && rnd() < Math.min(0.4, (f - 1) * 0.03);
+      list.push({ x, y: f * FH + dy, w, crumble, state: "solid", timer: 0 });
+      left = !left;
+    }
+  }
+  return list;
+}
+
+// ---------- state ----------
+let S;
+let best = null;
+try { best = JSON.parse(localStorage.getItem("investorTower.best")); } catch (e) {}
+
+function newGame(mode) {
+  S = {
+    mode, paused: false, t: 0, shake: 0, banner: null, toasts: [], door: null, result: null,
+    el: COLS.map(c => ({ off: Math.random() * FH, v: 0, target: 0, left: 0 })),
+    plats: buildPlatforms(),
+    p: { x: 157, y: BASE * FH, vx: 0, vy: 0, face: 1, ground: true, coyote: 0, jumpBuf: 0,
+         peak: BASE * FH, stun: 0, knock: 0, anim: 0, cab: null },
+    camY: BASE * FH - 12,
+  };
+  for (const i of ELEV) { nextRegime(i); S.el[i].v = S.el[i].target; }
+}
+
+function nextRegime(i) {
+  const c = COLS[i], e = S.el[i], m = MARKET[c.id];
+  if (m.drift !== undefined) { e.target = m.drift; e.left = 1e9; return; }
+  if (Math.random() < m.pUp) {
+    e.target = m.up * rand(0.6, 1.4); e.left = rand(3, 8);
+  } else if (Math.random() < m.crashP) {
+    e.target = -m.crash * rand(0.8, 1.2); e.left = rand(4, 6);
+    if (S.mode === "play") { S.banner = { text: c.name + " CRASH!", t: 2.5, color: "#ff5a4f" }; S.shake = 0.6; }
+  } else {
+    e.target = -m.down * rand(0.6, 1.4); e.left = rand(1.5, 4);
+  }
+}
+
+function toast(text, color, x, y) {
+  const p = S.p;
+  S.toasts.push({ text, color: color || "#f2efe6", x: x ?? playerX(), y: y ?? playerY() + PH + 4, t: 1.2 });
+}
+function playerX() { const p = S.p; return p.cab ? COLS[p.cab.i].x + 2 + p.cab.lx : p.x; }
+function playerY() { const p = S.p; return p.cab ? p.cab.floorY + p.cab.ly : p.y; }
+
+// Floor y of the cabin of column i nearest to world y.
+function cabinNear(i, y) {
+  const base = COLS[i].bottom * FH, ph = mod(S.el[i].off, FH);
+  return base + ph + Math.round((y - base - ph) / FH) * FH;
+}
+
+// ---------- input ----------
+const keys = { left: false, right: false, jump: false, act: false };
+const pressed = new Set();
+function actionOf(e) {
+  const k = e.key.toLowerCase(), c = e.code;
+  if (c === "ArrowLeft" || k === "a" || k === "q") return "left";
+  if (c === "ArrowRight" || k === "d") return "right";
+  if (c === "ArrowUp" || k === "w" || k === "z") return "jump";
+  if (c === "Space" || c === "Enter") return "act";
+  if (k === "p" || c === "Escape") return "pause";
+  return null;
+}
+addEventListener("keydown", e => {
+  const a = actionOf(e); if (!a) return;
+  e.preventDefault();
+  if (!e.repeat) pressed.add(a);
+  keys[a] = true;
+});
+addEventListener("keyup", e => { const a = actionOf(e); if (a) keys[a] = false; });
+addEventListener("blur", () => { for (const k in keys) keys[k] = false; });
+
+// ---------- update ----------
+function update(dt) {
+  if (S.mode !== "play") {
+    if (pressed.has("act")) newGame("play");
+    return;
+  }
+  if (pressed.has("pause")) S.paused = !S.paused;
+  if (S.paused) return;
+
+  S.t += dt;
+  for (const i of ELEV) {
+    const e = S.el[i];
+    if ((e.left -= dt) <= 0) nextRegime(i);
+    e.v += (e.target - e.v) * Math.min(1, dt * 2);
+    const d = e.v * FH * dt;
+    e.off += d;
+    if (S.p.cab && S.p.cab.i === i) S.p.cab.floorY += d;
+  }
+  for (const pl of S.plats) {
+    if (pl.state === "shaking" && (pl.timer -= dt) <= 0) { pl.state = "gone"; pl.timer = 3; }
+    else if (pl.state === "gone" && (pl.timer -= dt) <= 0) pl.state = "solid";
+  }
+
+  const p = S.p;
+  p.stun = Math.max(0, p.stun - dt);
+  p.knock = Math.max(0, p.knock - dt);
+  const ctl = p.stun > 0 ? 0 : (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+  if (ctl) p.face = ctl;
+  p.vx = ctl * RUN;
+  p.anim = ctl ? p.anim + dt : 0;
+  if (pressed.has("jump")) p.jumpBuf = 0.12; else p.jumpBuf = Math.max(0, p.jumpBuf - dt);
+
+  if (p.cab) updateCabin(dt); else updateFree(dt);
+  if (pressed.has("act") && p.stun <= 0) tryDoor();
+
+  if (S.mode === "play" && playerY() >= TOP * FH) finish(true);
+  else if (S.t >= GAME_TIME) finish(false);
+
+  for (const t of S.toasts) { t.t -= dt; t.y += 14 * dt; }
+  S.toasts = S.toasts.filter(t => t.t > 0);
+  if (S.banner && (S.banner.t -= dt) <= 0) S.banner = null;
+  S.shake = Math.max(0, S.shake - dt);
+  const target = Math.min(Math.max(playerY() - 64, BASE * FH - 12), (TOP + 1) * FH + 40 - H);
+  S.camY += (target - S.camY) * Math.min(1, dt * 6);
+}
+
+function overlap(ax, ay, aw, ah, b) { return ax < b.x + b.w && ax + aw > b.x && ay < b.y + b.h && ay + ah > b.y; }
+
+function updateFree(dt) {
+  const p = S.p, d = S.door;
+  // Walk through an open elevator door.
+  if (d && d.open && !d.fromCab && p.vx) {
+    const c = COLS[d.i];
+    if ((d.side === "L" && p.vx > 0 && p.x + PW >= c.x - 0.5) || (d.side === "R" && p.vx < 0 && p.x <= c.x + c.w + 0.5)) {
+      p.cab = { i: d.i, floorY: cabinNear(d.i, d.f * FH), lx: d.side === "L" ? 0 : c.w - 4 - PW, ly: 0, vy: 0 };
+      S.door = null;
+      return;
+    }
+  }
+  if (p.jumpBuf > 0 && p.coyote > 0 && p.stun <= 0) { p.vy = JUMP_V; p.jumpBuf = 0; p.coyote = 0; }
+  if (!keys.jump && p.vy > 60) p.vy = 60;
+  p.vy = Math.max(p.vy - GRAV * dt, -MAX_FALL);
+
+  const steps = Math.max(1, Math.ceil(Math.max(Math.abs(p.vx), Math.abs(p.vy)) * dt / 2));
+  const h = dt / steps;
+  let landed = null;
+  for (let s = 0; s < steps; s++) {
+    p.x += p.vx * h;
+    for (const b of SOLIDS) if (overlap(p.x, p.y, PW, PH, b)) p.x = p.vx > 0 ? b.x - PW : b.x + b.w;
+    const prevY = p.y;
+    p.y += p.vy * h;
+    for (const b of SOLIDS) {
+      if (!overlap(p.x, p.y, PW, PH, b)) continue;
+      if (p.vy <= 0) { p.y = b.y + b.h; p.vy = 0; landed = b; } else { p.y = b.y - PH; p.vy = 0; }
+    }
+    if (p.vy <= 0) for (const pl of S.plats) {
+      if (pl.state === "gone" || prevY < pl.y || p.y >= pl.y || p.x >= pl.x + pl.w || p.x + PW <= pl.x) continue;
+      p.y = pl.y; p.vy = 0; landed = pl;
+      if (pl.crumble && pl.state === "solid") { pl.state = "shaking"; pl.timer = 0.6; }
+    }
+  }
+  p.ground = !!landed;
+  if (p.ground) {
+    if (p.peak - p.y > FH * 0.9) {
+      p.stun = 1; S.shake = 0.3;
+      toast(OUCH[Math.floor(Math.random() * OUCH.length)], "#ff8a5c");
+    }
+    p.peak = p.y; p.coyote = 0.08;
+  } else {
+    p.peak = Math.max(p.peak, p.y); p.coyote = Math.max(0, p.coyote - dt);
+  }
+}
+
+function updateCabin(dt) {
+  const p = S.p, cab = p.cab, c = COLS[cab.i], d = S.door;
+  const maxLx = c.w - 4 - PW;
+  // Walk out through an open door.
+  if (d && d.open && d.fromCab && p.vx) {
+    if ((d.side === "R" && p.vx > 0 && cab.lx >= maxLx - 0.5) || (d.side === "L" && p.vx < 0 && cab.lx <= 0.5)) {
+      p.x = d.side === "R" ? c.x + c.w : c.x - PW;
+      p.y = p.peak = d.f * FH; p.vy = 0; p.cab = null; S.door = null;
+      return;
+    }
+  }
+  cab.lx = Math.min(maxLx, Math.max(0, cab.lx + p.vx * dt));
+  if (p.jumpBuf > 0 && cab.ly === 0 && p.stun <= 0) { cab.vy = JUMP_V; p.jumpBuf = 0; }
+  if (!keys.jump && cab.vy > 60) cab.vy = 60;
+  cab.vy -= GRAV * dt;
+  cab.ly += cab.vy * dt;
+  if (cab.ly <= 0) { cab.ly = 0; cab.vy = 0; }
+  if (cab.ly >= CAB_IN - PH) { cab.ly = CAB_IN - PH; cab.vy = Math.min(cab.vy, 0); }
+
+  // Carried below the bottom of the column: thrown out at its lowest floor.
+  if (cab.floorY < c.bottom * FH - TOL) {
+    const side = cab.i < WORK ? "R" : "L";
+    p.x = side === "R" ? c.x + c.w : c.x - PW;
+    p.y = p.peak = c.bottom * FH; p.vy = 0; p.cab = null; S.door = null;
+    p.stun = 0.6; S.shake = 0.4;
+    toast(EJECT[c.id], "#ff5a4f");
+  }
+}
+
+function tryDoor() {
+  const p = S.p;
+  let i, side, f, cabY;
+  if (p.cab) {
+    const c = COLS[p.cab.i];
+    i = p.cab.i; side = p.face > 0 ? "R" : "L";
+    if (side === "R" ? p.cab.lx < c.w - 4 - PW - 1 : p.cab.lx > 1) return;
+    f = Math.round(p.cab.floorY / FH);
+    const r = landingRange(side === "R" ? i : i - 1);
+    if (!r || f < r[0] || f > r[1]) { toast("NO EXIT"); return; }
+    cabY = p.cab.floorY;
+  } else {
+    if (!p.ground) return;
+    f = Math.round(p.y / FH);
+    if (Math.abs(p.y - f * FH) > 0.5) return;
+    i = -1;
+    for (const j of ELEV) {
+      const c = COLS[j];
+      if (p.face > 0 && Math.abs(p.x + PW - c.x) < 1.5) { i = j; side = "L"; }
+      if (p.face < 0 && Math.abs(p.x - c.x - c.w) < 1.5) { i = j; side = "R"; }
+    }
+    if (i < 0 || f < COLS[i].bottom || f > TOP) return;
+    cabY = cabinNear(i, f * FH);
+  }
+  if (Math.abs(cabY - f * FH) > TOL) { toast("WAIT..."); return; }
+  const fromCab = !!p.cab;
+  let d = S.door;
+  if (!d || d.i !== i || d.side !== side || d.f !== f || d.fromCab !== fromCab) d = S.door = { i, side, f, fromCab, knocks: 0, open: false };
+  if (d.open) return;
+  const need = KNOCKS[COLS[i].id] || 1;
+  d.knocks++;
+  p.knock = 0.15;
+  if (d.knocks >= need) d.open = true;
+  else { toast("KNOCK " + d.knocks + "/" + need, "#e0a37c"); S.shake = 0.08; }
+}
+
+// Close the door as soon as the cabin is no longer level with the floor.
+function checkDoor() {
+  const d = S.door;
+  if (!d) return;
+  const y = d.fromCab ? (S.p.cab ? S.p.cab.floorY : null) : cabinNear(d.i, d.f * FH);
+  if (y === null || Math.abs(y - d.f * FH) > TOL) S.door = null;
+}
+
+function finish(won) {
+  const money = won ? 1e6 : moneyAt(playerY());
+  const age = 20 + 45 * Math.min(S.t, GAME_TIME) / GAME_TIME;
+  S.mode = "end";
+  S.result = { won, money, age };
+  const better = !best || (won && (!best.won || age < best.age)) || (!won && !best.won && money > best.money);
+  if (better) {
+    best = { won, money, age };
+    try { localStorage.setItem("investorTower.best", JSON.stringify(best)); } catch (e) {}
+  }
+}
+
+// ---------- drawing ----------
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+let camI = 0; // integer camera y used while drawing
+
+function resize() {
+  const s = Math.max(1, Math.floor(Math.min(innerWidth / W, innerHeight / H)));
+  cv.style.width = W * s + "px"; cv.style.height = H * s + "px";
+}
+addEventListener("resize", resize); resize();
+
+function sy(y) { return H - (y - camI); }                   // world y -> screen y
+function R(x, y, w, h, color) {                             // world rect (y = bottom)
+  ctx.fillStyle = color;
+  ctx.fillRect(Math.round(x), Math.round(sy(y + h)), w, Math.round(h));
+}
+
+// 3x5 pixel font, rows as 3-bit masks (4 = left column).
+const FONT = {
+  "0": [7,5,5,5,7], "1": [2,6,2,2,7], "2": [7,1,7,4,7], "3": [7,1,3,1,7], "4": [5,5,7,1,1],
+  "5": [7,4,7,1,7], "6": [7,4,7,5,7], "7": [7,1,1,2,2], "8": [7,5,7,5,7], "9": [7,5,7,1,7],
+  A: [2,5,7,5,5], B: [6,5,6,5,6], C: [3,4,4,4,3], D: [6,5,5,5,6], E: [7,4,6,4,7], F: [7,4,6,4,4],
+  G: [3,4,5,5,3], H: [5,5,7,5,5], I: [7,2,2,2,7], J: [1,1,1,5,2], K: [5,5,6,5,5], L: [4,4,4,4,7],
+  M: [5,7,7,5,5], N: [6,5,5,5,5], O: [2,5,5,5,2], P: [6,5,6,4,4], Q: [2,5,5,6,3], R: [6,5,6,5,5],
+  S: [3,4,2,1,6], T: [7,2,2,2,2], U: [5,5,5,5,7], V: [5,5,5,5,2], W: [5,5,7,7,5], X: [5,5,2,5,5],
+  Y: [5,5,2,2,2], Z: [7,1,2,4,7], "$": [3,6,2,3,6], ".": [0,0,0,0,2], ",": [0,0,0,2,4],
+  ":": [0,2,0,2,0], "-": [0,0,7,0,0], "+": [0,2,7,2,0], "!": [2,2,2,0,2], "?": [6,1,2,0,2],
+  "%": [5,1,2,4,5], "/": [1,1,2,4,4], "&": [2,5,2,5,3], "'": [2,2,0,0,0], ">": [4,2,1,2,4],
+  "<": [1,2,4,2,1], "(": [1,2,2,2,1], ")": [4,2,2,2,4], " ": [0,0,0,0,0],
+};
+function textWidth(s, k = 1) { return s.length * 4 * k - k; }
+function text(s, x, y, color, k = 1, align = "left") {
+  s = String(s).toUpperCase();
+  if (align === "center") x -= Math.floor(textWidth(s, k) / 2);
+  else if (align === "right") x -= textWidth(s, k);
+  ctx.fillStyle = color;
+  for (let n = 0; n < s.length; n++) {
+    const g = FONT[s[n]] || FONT["?"];
+    for (let r = 0; r < 5; r++) for (let b = 0; b < 3; b++)
+      if (g[r] & (4 >> b)) ctx.fillRect(x + (n * 4 + b) * k, y + r * k, k, k);
+  }
+}
+function shadowText(s, x, y, color, k = 1, align = "left") {
+  text(s, x + k, y + k, "#0d0c18", k, align);
+  text(s, x, y, color, k, align);
+}
+
+// Pixel sprites: one char per pixel, "." = transparent.
+function sprite(rows, pal, x, y, flip) { // x, y = screen top-left
+  for (let r = 0; r < rows.length; r++) for (let c = 0; c < rows[r].length; c++) {
+    const ch = rows[r][flip ? rows[r].length - 1 - c : c];
+    if (ch === ".") continue;
+    ctx.fillStyle = pal[ch];
+    ctx.fillRect(x + c, y + r, 1, 1);
+  }
+}
+const ICONS = {
+  btc:  [".#.#...", "#####..", ".#...#.", ".####..", ".#...#.", "#####..", ".#.#..."],
+  sp:   ["#......", "#.....#", "#....#.", "#.#.#..", "#..#...", "#......", "#######"],
+  fiat: ["...#...", ".#####.", "#..#...", ".#####.", "...#..#", ".#####.", "...#..."],
+  immo: ["...#...", "..###..", ".#####.", "#######", ".#...#.", ".#.#.#.", ".#####."],
+};
+const HERO = [
+  "..hh..", ".hhhh.", ".hsss.", ".ssks.", "..ss..", ".jwtj.",
+  "jjwtjj", "jjjtjj", "sjjjjs", ".pppp.",
+];
+const LEGS = [[".p..p.", ".b..b."], [".pp.p.", "bb...b"], [".p.pp.", "b...bb"]];
+const HERO_PAL = { h: "#3a2418", s: "#f0c39a", k: "#1a1a1a", j: "#2d3550", w: "#f2f2f2",
+  t: "#c0392b", p: "#232838", b: "#0e0e14" };
+
+function drawPlayer() {
+  const p = S.p;
+  const x = Math.round(playerX()), y = Math.round(sy(playerY() + PH));
+  const airborne = p.cab ? p.cab.ly > 0 : !p.ground;
+  const legs = airborne ? LEGS[1] : p.anim ? LEGS[1 + (Math.floor(p.anim * 8) % 2)] : LEGS[0];
+  sprite(HERO.concat(legs), HERO_PAL, x, y, p.face < 0);
+  if (p.knock > 0) { ctx.fillStyle = HERO_PAL.s; ctx.fillRect(p.face > 0 ? x + 6 : x - 2, y + 7, 2, 2); }
+  if (p.stun > 0 && Math.floor(S.t * 8) % 2) {
+    ctx.fillStyle = "#ffd34d";
+    ctx.fillRect(x - 1, y - 3, 1, 1); ctx.fillRect(x + 3, y - 4, 1, 1); ctx.fillRect(x + 7, y - 3, 1, 1);
+  }
+}
+
+function drawCabin(i, y) {
+  const c = COLS[i], d = S.door;
+  R(c.x, y - 3, c.w, FH, c.dark);
+  R(c.x + 2, y, c.w - 4, CAB_IN, c.main);
+  R(c.x + 4, y + 4, c.w - 8, CAB_IN - 8, c.light + "33");
+  R(c.x, y - 3, c.w, 3, "#9a93a8");
+  R(c.x, y + CAB_IN, c.w, 3, "#9a93a8");
+  sprite(ICONS[c.id], { "#": c.light }, c.x + c.w / 2 - 3, Math.round(sy(y + 30)), false);
+  // doors: a gap in the wall when open
+  if (d && d.open && d.i === i && Math.abs(y - d.f * FH) <= TOL + 0.5) {
+    R(d.side === "L" ? c.x : c.x + c.w - 2, y, 2, 16, c.main);
+  }
+}
+
+function drawWorld() {
+  const y0 = camI, y1 = camI + H;
+  // sky above the roof, facade walls
+  ctx.fillStyle = "#141532"; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "#d8d4ff";
+  for (let n = 0; n < 40; n++) {
+    const sx = (n * 73) % W, wy = (TOP + 1) * FH + 10 + ((n * 37) % 200);
+    if (wy > y0 && wy < y1) ctx.fillRect(sx, Math.round(sy(wy)), 1, 1);
+  }
+  const roofY = (TOP + 1) * FH - 4;
+  R(12, -5000, 296, roofY + 5000, "#4a4360");               // interior wall
+  // hallway decoration: wainscot and floor labels
+  for (let f = Math.floor(y0 / FH) - 1; f <= Math.ceil(y1 / FH); f++) {
+    if (f < BASE || f > TOP) continue;
+    for (const l of LANDINGS) {
+      if (f < l.fmin) continue;
+      R(l.x, f * FH, l.w, CAB_IN + 2, f === TOP ? "#7a6630" : f < 0 ? "#38324a" : "#5b5470");
+      R(l.x, f * FH, l.w, 10, f === TOP ? "#5e4e22" : "#4b4560");
+      R(l.x, f * FH + 10, l.w, 1, "#6d6684");
+    }
+  }
+  // ground and basement
+  R(12, -5000, 296, 5000, "#2a2018");
+  R(132, BASE * FH, 76, -BASE * FH, "#2e283c");
+  for (const l of LANDINGS) if (l.fmin < 0)
+    for (let f = l.fmin; f < 0; f++) R(l.x, f * FH, l.w, FH - 4, "#38324a");
+  // work column: bricks up to the career ceiling, then hallways
+  const wc = COLS[WORK];
+  const brickTop = WORK_TOP * FH;
+  R(wc.x, BASE * FH, wc.w, brickTop - BASE * FH, "#4a3b35");
+  for (let by = Math.max(BASE * FH, Math.floor(y0 / 4) * 4); by < Math.min(brickTop, y1); by += 4) {
+    R(wc.x, by, wc.w, 1, "#3b2e2a");
+    for (let bx = wc.x + ((by / 4) % 2 ? 0 : 4); bx < wc.x + wc.w; bx += 8) R(bx, by + 1, 1, 3, "#3b2e2a");
+  }
+  for (let f = WORK_TOP; f <= TOP; f++) {
+    R(wc.x, f * FH, wc.w, CAB_IN + 2, f === TOP ? "#7a6630" : "#5b5470");
+    R(wc.x, f * FH, wc.w, 10, f === TOP ? "#5e4e22" : "#4b4560");
+  }
+  for (let f = BASE; f <= TOP; f++) {
+    const ly = f * FH + 40;
+    if (ly < y0 - 10 || ly > y1 + 10 || f === WORK_TOP - 1) continue; // that spot holds the ceiling sign
+    text(fmtMoney(moneyAt(f * FH)), wc.x + wc.w / 2, Math.round(sy(ly)), "#8c7f9a", 1, "center");
+  }
+  if (brickTop > y0 && brickTop - 30 < y1) {
+    R(wc.x + 4, brickTop - 12, wc.w - 8, 9, "#20304a");
+    text("GLASS CEILING", wc.x + wc.w / 2, Math.round(sy(brickTop - 4)), "#9fd3ff", 1, "center");
+  }
+  // elevator shafts and cabins
+  for (const i of ELEV) {
+    const c = COLS[i], e = S.el[i];
+    const lo = c.bottom * FH - 4, hi = roofY;
+    R(c.x, lo, c.w, hi - lo, "#18162a");
+    R(c.x + 5, lo, 1, hi - lo, "#2c2840"); R(c.x + c.w - 6, lo, 1, hi - lo, "#2c2840");
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(c.x, Math.round(sy(hi)), c.w, hi - lo);
+    ctx.clip();
+    const base = c.bottom * FH, loop = 2 * (TOP - c.bottom + 1) * FH;
+    for (let k = 0; k < loop / FH; k++) {
+      const pos = mod(k * FH + e.off, loop);
+      for (const y of [base + pos, base + pos - loop]) if (y > y0 - FH && y < y1 + FH) drawCabin(i, y);
+    }
+    ctx.restore();
+  }
+  // slabs, roof
+  for (const l of LANDINGS) for (let f = l.fmin; f <= TOP; f++) {
+    R(l.x, f * FH - 4, l.w, 4, "#8b8198"); R(l.x, f * FH - 1, l.w, 1, "#b3a9bf");
+  }
+  R(12, roofY, 296, 6, "#8b8198");
+  // work platforms
+  for (const pl of S.plats) {
+    if (pl.state === "gone" || pl.y < y0 - 8 || pl.y > y1 + 8) continue;
+    const jit = pl.state === "shaking" ? (Math.floor(S.t * 30) % 2) : 0;
+    if (pl.hall) { R(pl.x, pl.y - 4, pl.w, 4, "#8b8198"); R(pl.x, pl.y - 1, pl.w, 1, "#b3a9bf"); continue; }
+    R(pl.x + jit, pl.y - 3, pl.w, 3, pl.crumble ? "#7a4f33" : "#a0703c");
+    R(pl.x + jit, pl.y - 1, pl.w, 1, pl.crumble ? "#9a6a48" : "#c89656");
+    if (pl.crumble) R(pl.x + jit + Math.floor(pl.w / 2), pl.y - 3, 1, 2, "#3b2e2a");
+  }
+  // facade
+  R(0, -5000, 12, 10000, "#26223a"); R(308, -5000, 12, 10000, "#26223a");
+  for (let f = Math.floor(y0 / FH) - 1; f <= Math.min(TOP, Math.ceil(y1 / FH)); f++) {
+    if (f < 0) continue;
+    R(3, f * FH + 16, 6, 14, "#3d5a80"); R(311, f * FH + 16, 6, 14, "#3d5a80");
+  }
+  if (S.mode !== "title") drawPlayer();
+  for (const t of S.toasts) {
+    if (t.t < 0.3 && Math.floor(t.t * 20) % 2) continue;
+    shadowText(t.text, Math.round(t.x + PW / 2), Math.round(sy(t.y)), t.color, 1, "center");
+  }
+}
+
+function drawHud() {
+  ctx.fillStyle = "#0d0c18e6"; ctx.fillRect(0, 0, W, 9); ctx.fillRect(0, H - 8, W, 8);
+  const p = S.p, y = playerY();
+  text(fmtMoney(moneyAt(y)), 3, 2, "#ffd34d");
+  const age = Math.floor(20 + 45 * Math.min(S.t, GAME_TIME) / GAME_TIME);
+  text("AGE " + age, W - 3, 2, age >= 60 ? "#ff8a5c" : "#f2efe6", 1, "right");
+  const zone = p.cab ? COLS[p.cab.i].title
+    : p.x + PW > COLS[WORK].x && p.x < COLS[WORK].x + COLS[WORK].w ? (y < 0 ? "BASEMENT" : "WORK") : "HALLWAY";
+  text(zone, W / 2, 2, "#b3a9bf", 1, "center");
+  for (let i = 0; i < COLS.length; i++) {
+    const c = COLS[i], cx = c.x + c.w / 2;
+    text(c.name, cx, H - 6, c.light || "#c89656", 1, "center");
+    if (i === WORK) continue;
+    const v = S.el[i].v, x = cx + textWidth(c.name) / 2 + 3;
+    ctx.fillStyle = v >= 0 ? "#5fd36a" : "#ff5a4f";
+    for (let r = 0; r < 3; r++) {
+      const half = v >= 0 ? r : 2 - r; // up: widens downwards; down: narrows downwards
+      ctx.fillRect(x + 2 - half, H - 5 + r, 1 + 2 * half, 1);
+    }
+  }
+  // wealth gauge on the right facade
+  const g0 = 14, g1 = H - 12, frac = (y / FH - BASE) / (TOP - BASE);
+  ctx.fillStyle = "#0d0c18"; ctx.fillRect(312, g0, 4, g1 - g0);
+  for (const f of [0, 7.5, 15, 22.5, 30]) {
+    ctx.fillStyle = "#8c7f9a"; ctx.fillRect(310, Math.round(g1 - (f - BASE) / (TOP - BASE) * (g1 - g0)), 2, 1);
+  }
+  ctx.fillStyle = "#ffd34d";
+  ctx.fillRect(312, Math.round(g1 - Math.max(0, Math.min(1, frac)) * (g1 - g0)) - 1, 4, 2);
+  if (S.banner && Math.floor(S.banner.t * 6) % 2) shadowText(S.banner.text, W / 2, 30, S.banner.color, 2, "center");
+}
+
+function panel(lines) {
+  ctx.fillStyle = "#07060dd9"; ctx.fillRect(0, 0, W, H);
+  let y = 28;
+  for (const [s, color, k] of lines) {
+    if (s) shadowText(s, W / 2, y, color, k, "center");
+    y += k === 2 ? 18 : 9;
+  }
+}
+
+function draw() {
+  const shake = S.shake > 0 ? Math.round(rand(-1.5, 1.5)) : 0;
+  camI = Math.round(S.camY) + shake;
+  drawWorld();
+  if (S.mode === "title") {
+    panel([
+      ["INVESTOR TOWER", "#ffd34d", 2], ["", "", 1],
+      ["CLIMB FROM $0 TO $1M BEFORE YOU RETIRE AT 65", "#f2efe6", 1], ["", "", 1],
+      ["BITCOIN   S&P 500   WORK   FIAT   REAL ESTATE", "#b3a9bf", 1],
+      ["WILD      RISES     JUMP   SINKS  SLOW, KNOCK 5X", "#8c7f9a", 1], ["", "", 1],
+      ["ARROWS / WASD MOVE   W / UP JUMP", "#f2efe6", 1],
+      ["SPACE OPENS ELEVATOR DOORS   P PAUSE", "#f2efe6", 1], ["", "", 1],
+      [best ? "BEST: " + (best.won ? "MILLIONAIRE AT " + Math.floor(best.age) : fmtMoney(best.money)) : "", "#8fd69c", 1],
+      ["", "", 1], ["PRESS SPACE", Math.floor(performance.now() / 400) % 2 ? "#ffd34d" : "#b08f2a", 1],
+    ]);
+  } else if (S.mode === "end") {
+    const r = S.result;
+    panel([
+      [r.won ? "MILLIONAIRE!" : "RETIRED AT 65", r.won ? "#ffd34d" : "#f2efe6", 2], ["", "", 1],
+      [r.won ? "$1,000,000 AT AGE " + Math.floor(r.age) : "NET WORTH " + fmtMoney(r.money), "#f2efe6", 1], ["", "", 1],
+      ["BEST: " + (best.won ? "MILLIONAIRE AT " + Math.floor(best.age) : fmtMoney(best.money)), "#8fd69c", 1],
+      ["", "", 1], ["PRESS SPACE TO PLAY AGAIN", Math.floor(performance.now() / 400) % 2 ? "#ffd34d" : "#b08f2a", 1],
+    ]);
+  } else {
+    drawHud();
+    if (S.paused) panel([["PAUSED", "#f2efe6", 2], ["", "", 1], ["P TO RESUME", "#b3a9bf", 1]]);
+  }
+}
+
+// ---------- main loop ----------
+newGame("title");
+let last = performance.now();
+function step(dt) {
+  update(dt);
+  if (S.mode === "play") checkDoor();
+  pressed.clear();
+}
+function frame(now) {
+  step(Math.min(0.033, (now - last) / 1000));
+  last = now;
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+window.IT = { get S() { return S; }, newGame, moneyAt, cabinNear, step, draw, keys, pressed }; // console/testing hooks
+</script>
+</body>
+</html>
