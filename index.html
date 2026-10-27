@@ -18,12 +18,14 @@
 // ---------- constants ----------
 const W = 320, H = 360;
 const FH = 48;            // floor height (px)
-const TOP = 30;           // top floor = $1M
+const TOP = 97;           // top floor = $1M (each floor is worth 10% more)
 const BASE = -2;          // basement bottom floor = $0
 const GAME_TIME = 600;    // seconds from age 20 to 65
 const YEAR = GAME_TIME / 45;
 const HUD_TOP = 18, HUD_BOT = 16;
 const TOL = 8;            // max misalignment (px) for an elevator door to open
+const DOOR_TOL = { fiat: FH / 2, immo: 16 }; // fiat is liquid: its doors always open
+const SAVINGS = 4000;     // Work: the salary cap rises by this many $ per year
 const PW = 6, PH = 12;    // player size
 const GRAV = 600, JUMP_V = 170, RUN = 60, MAX_FALL = 300;
 const CAB_IN = 42;        // cabin interior height
@@ -45,10 +47,12 @@ const ELEV = [0, 1, 3, 4];
 
 // Speeds in floors per second. Volatile markets switch between up and down phases.
 const MARKET = {
-  fiat: { drift: -0.05 },
-  immo: { drift: 0.04 },
-  sp:  { pUp: 0.68, up: 0.12, down: 0.18, crashP: 0.04, crash: 0.4 },
-  btc: { pUp: 0.58, up: 0.36, down: 0.54, crashP: 0.08, crash: 1.2 },
+  fiat: { drift: -0.0241 },  // -3% a year
+  immo: { drift: 0.0385 },   // +5% a year
+  // about +10% a year, down one year in five
+  sp:  { pUp: 0.62, up: 0.18, down: 0.195, crashP: 0.06, crash: 0.51, crashT: [4, 6] },
+  // about +30% a year, down one year in four, crashes up to -90%
+  btc: { pUp: 0.6, up: 0.67, down: 0.62, crashP: 0.1, crash: 1.54, crashT: [8, 12] },
 };
 const KNOCKS = { immo: 5 };
 const EJECT = { btc: "REKT!", sp: "MARGIN CALL", fiat: "INFLATION ATE IT", immo: "FORECLOSED" };
@@ -100,7 +104,7 @@ function landingRange(a) { // landing between COLS[a] and COLS[a + 1]
   return a < 0 || a >= LANDINGS.length ? null : [LANDINGS[a].fmin, TOP];
 }
 
-// One-way platforms of the Work column (ledges, platforms, hallways above the career ceiling).
+// One-way platforms of the Work column (ledges at hallway level, platforms, penthouse floor).
 function buildPlatforms() {
   const rnd = mulberry32(20261027);
   const list = [];
@@ -134,7 +138,7 @@ function newGame(mode) {
     el: COLS.map(c => ({ off: Math.random() * FH, v: 0, target: 0, left: 0 })),
     plats: buildPlatforms(),
     p: { x: 157, y: BASE * FH, vx: 0, vy: 0, face: 1, ground: true, coyote: 0, jumpBuf: 0,
-         peak: BASE * FH, stun: 0, knock: 0, anim: 0, cab: null },
+         peak: BASE * FH, lastGround: BASE * FH, stun: 0, knock: 0, anim: 0, cab: null },
     camY: BASE * FH - HUD_BOT - 4,
   };
   for (const i of ELEV) { nextRegime(i); S.el[i].v = S.el[i].target; }
@@ -151,7 +155,7 @@ function nextRegime(i) {
   if (Math.random() < m.pUp) {
     e.target = m.up * rand(0.6, 1.4); e.left = rand(3, 8);
   } else if (Math.random() < m.crashP) {
-    e.target = -m.crash * rand(0.8, 1.2); e.left = rand(4, 6);
+    e.target = -m.crash * rand(0.8, 1.2); e.left = rand(...m.crashT);
     if (S.mode === "play") { S.banner = { text: c.name + " CRASH!", t: 2.5, color: "#ff5a4f" }; S.shake = 0.6; }
   } else {
     e.target = -m.down * rand(0.6, 1.4); e.left = rand(1.5, 4);
@@ -164,6 +168,15 @@ function toast(text, color, x, y) {
 }
 function playerX() { const p = S.p; return p.cab ? COLS[p.cab.i].x + 2 + p.cab.lx : p.x; }
 function playerY() { const p = S.p; return p.cab ? p.cab.floorY + p.cab.ly : p.y; }
+
+function doorTol(i) { return DOOR_TOL[COLS[i].id] || TOL; }
+
+// Work only lifts you up to what a salary lets you save: platforms above this height
+// hold you only if you came from at least their level.
+function capY() {
+  const age = 20 + 45 * Math.min(S.t, GAME_TIME) / GAME_TIME;
+  return Math.log10(1 + SAVINGS / 100 * (age - 20)) * TOP / 4 * FH;
+}
 
 // Floor y of the cabin of column i nearest to world y.
 function cabinNear(i, y) {
@@ -270,7 +283,7 @@ function updateFree(dt) {
       if (p.vy <= 0) { p.y = b.y + b.h; p.vy = 0; landed = b; } else { p.y = b.y - PH; p.vy = 0; }
     }
     if (p.vy <= 0) for (const pl of S.plats) {
-      if (pl.state === "gone" || prevY < pl.y || p.y >= pl.y || p.x >= pl.x + pl.w || p.x + PW <= pl.x) continue;
+      if (pl.state === "gone" || pl.y > capY() && p.lastGround < pl.y - 0.5 || prevY < pl.y || p.y >= pl.y || p.x >= pl.x + pl.w || p.x + PW <= pl.x) continue;
       p.y = pl.y; p.vy = 0; landed = pl;
       if (pl.crumble && pl.state === "solid") { pl.state = "shaking"; pl.timer = 0.6; }
     }
@@ -281,7 +294,7 @@ function updateFree(dt) {
       p.stun = 1; S.shake = 0.3;
       toast(OUCH[Math.floor(Math.random() * OUCH.length)], "#ff8a5c");
     }
-    p.peak = p.y; p.coyote = 0.08;
+    p.peak = p.lastGround = p.y; p.coyote = 0.08;
   } else {
     p.peak = Math.max(p.peak, p.y); p.coyote = Math.max(0, p.coyote - dt);
   }
@@ -294,7 +307,7 @@ function updateCabin(dt) {
   if (d && d.open && d.fromCab && p.vx) {
     if ((d.side === "R" && p.vx > 0 && cab.lx >= maxLx - 0.5) || (d.side === "L" && p.vx < 0 && cab.lx <= 0.5)) {
       p.x = d.side === "R" ? c.x + c.w : c.x - PW;
-      p.y = p.peak = d.f * FH; p.vy = 0; p.cab = null; S.door = null;
+      p.y = p.peak = p.lastGround = d.f * FH; p.vy = 0; p.cab = null; S.door = null;
       return;
     }
   }
@@ -307,10 +320,10 @@ function updateCabin(dt) {
   if (cab.ly >= CAB_IN - PH) { cab.ly = CAB_IN - PH; cab.vy = Math.min(cab.vy, 0); }
 
   // Carried below the bottom of the column: thrown out at its lowest floor.
-  if (cab.floorY < c.bottom * FH - TOL) {
+  if (cab.floorY < c.bottom * FH - doorTol(cab.i)) {
     const side = cab.i < WORK ? "R" : "L";
     p.x = side === "R" ? c.x + c.w : c.x - PW;
-    p.y = p.peak = c.bottom * FH; p.vy = 0; p.cab = null; S.door = null;
+    p.y = p.peak = p.lastGround = c.bottom * FH; p.vy = 0; p.cab = null; S.door = null;
     p.stun = 0.6; S.shake = 0.4;
     toast(EJECT[c.id], "#ff5a4f");
   }
@@ -340,7 +353,7 @@ function tryDoor() {
     if (i < 0 || f < COLS[i].bottom || f > TOP) return;
     cabY = cabinNear(i, f * FH);
   }
-  if (Math.abs(cabY - f * FH) > TOL) { toast("WAIT..."); return; }
+  if (Math.abs(cabY - f * FH) > doorTol(i)) { toast("WAIT..."); return; }
   const fromCab = !!p.cab;
   let d = S.door;
   if (!d || d.i !== i || d.side !== side || d.f !== f || d.fromCab !== fromCab) d = S.door = { i, side, f, fromCab, knocks: 0, open: false };
@@ -357,7 +370,7 @@ function checkDoor() {
   const d = S.door;
   if (!d) return;
   const y = d.fromCab ? (S.p.cab ? S.p.cab.floorY : null) : cabinNear(d.i, d.f * FH);
-  if (y === null || Math.abs(y - d.f * FH) > TOL) S.door = null;
+  if (y === null || Math.abs(y - d.f * FH) > doorTol(d.i)) S.door = null;
 }
 
 function finish(won) {
@@ -464,7 +477,7 @@ function drawCabin(i, y) {
   R(c.x, y + CAB_IN, c.w, 3, "#9a93a8");
   sprite(ICONS[c.id], { "#": c.light }, c.x + c.w / 2 - 3, Math.round(sy(y + 30)), false);
   // doors: a gap in the wall when open
-  if (d && d.open && d.i === i && Math.abs(y - d.f * FH) <= TOL + 0.5) {
+  if (d && d.open && d.i === i && Math.abs(y - d.f * FH) <= doorTol(i) + 0.5) {
     R(d.side === "L" ? c.x : c.x + c.w - 2, y, 2, 16, c.main);
   }
 }
@@ -478,7 +491,7 @@ function drawWorld() {
     const sx = (n * 73) % W, wy = (TOP + 1) * FH + 10 + ((n * 37) % 200);
     if (wy > y0 && wy < y1) ctx.fillRect(sx, Math.round(sy(wy)), 1, 1);
   }
-  const roofY = (TOP + 1) * FH - 4;
+  const roofY = (TOP + 1) * FH - 4, cap = capY();
   R(12, -5000, 296, roofY + 5000, "#4a4360");               // interior wall
   // hallway decoration: wainscot and floor labels
   for (let f = Math.floor(y0 / FH) - 1; f <= Math.ceil(y1 / FH); f++) {
@@ -535,11 +548,17 @@ function drawWorld() {
   // work platforms
   for (const pl of S.plats) {
     if (pl.state === "gone" || pl.y < y0 - 8 || pl.y > y1 + 8) continue;
+    if (!pl.hall && pl.y > cap) { R(pl.x, pl.y - 3, pl.w, 3, "#3b3340"); continue; } // above the salary cap
     const jit = pl.state === "shaking" ? (Math.floor(S.t * 30) % 2) : 0;
     if (pl.hall) { R(pl.x, pl.y - 4, pl.w, 4, "#8b8198"); R(pl.x, pl.y - 1, pl.w, 1, "#b3a9bf"); continue; }
     R(pl.x + jit, pl.y - 3, pl.w, 3, pl.crumble ? "#7a4f33" : "#a0703c");
     R(pl.x + jit, pl.y - 1, pl.w, 1, pl.crumble ? "#9a6a48" : "#c89656");
     if (pl.crumble) R(pl.x + jit + Math.floor(pl.w / 2), pl.y - 3, 1, 2, "#3b2e2a");
+  }
+  // salary cap
+  if (cap > y0 - 10 && cap < y1 + 10) {
+    R(wc.x, cap, wc.w, 1, "#9fd3ff");
+    text("CAP " + fmtMoney(moneyAt(cap)), wc.x + wc.w / 2, Math.round(sy(cap)) - 7, "#9fd3ff", 1, "center");
   }
   // facade
   R(0, -5000, 12, 10000, "#26223a"); R(308, -5000, 12, 10000, "#26223a");
@@ -588,7 +607,7 @@ function drawHud() {
   // wealth gauge on the right facade
   const g0 = HUD_TOP + 6, g1 = H - HUD_BOT - 6, frac = (y / FH - BASE) / (TOP - BASE);
   ctx.fillStyle = "#0d0c18"; ctx.fillRect(312, g0, 4, g1 - g0);
-  for (const f of [0, 7.5, 15, 22.5, 30]) {
+  for (const f of [0, TOP / 4, TOP / 2, TOP * 3 / 4, TOP]) {
     ctx.fillStyle = "#8c7f9a"; ctx.fillRect(310, Math.round(g1 - (f - BASE) / (TOP - BASE) * (g1 - g0)), 2, 1);
   }
   ctx.fillStyle = "#ffd34d";
@@ -649,7 +668,7 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
-window.IT = { get S() { return S; }, newGame, moneyAt, cabinNear, step, draw, keys, pressed }; // console/testing hooks
+window.IT = { get S() { return S; }, newGame, moneyAt, cabinNear, capY, step, draw, keys, pressed }; // console/testing hooks
 </script>
 </body>
 </html>
