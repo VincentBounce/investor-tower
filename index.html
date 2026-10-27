@@ -11,17 +11,18 @@
 </style>
 </head>
 <body>
-<canvas id="c" width="320" height="180"></canvas>
+<canvas id="c" width="320" height="360"></canvas>
 <script>
 "use strict";
 
 // ---------- constants ----------
-const W = 320, H = 180;
+const W = 320, H = 360;
 const FH = 48;            // floor height (px)
 const TOP = 30;           // top floor = $1M
 const BASE = -2;          // basement bottom floor = $0
-const WORK_TOP = 15;      // career ceiling: no platforms above this floor
 const GAME_TIME = 600;    // seconds from age 20 to 65
+const YEAR = GAME_TIME / 45;
+const HUD_TOP = 18, HUD_BOT = 16;
 const TOL = 8;            // max misalignment (px) for an elevator door to open
 const PW = 6, PH = 12;    // player size
 const GRAV = 600, JUMP_V = 170, RUN = 60, MAX_FALL = 300;
@@ -103,14 +104,14 @@ function landingRange(a) { // landing between COLS[a] and COLS[a + 1]
 function buildPlatforms() {
   const rnd = mulberry32(20261027);
   const list = [];
-  for (let f = BASE + 1; f < WORK_TOP; f++) {
+  for (let f = BASE + 1; f < TOP; f++) {
     if (f >= 0) list.push({ x: 132, y: f * FH, w: 6 });
     list.push({ x: 182, y: f * FH, w: 6 });
   }
-  for (let f = WORK_TOP; f <= TOP; f++) list.push({ x: 132, y: f * FH, w: 56, hall: true });
+  list.push({ x: 132, y: TOP * FH, w: 56, hall: true }); // penthouse floor
   let left = true;
-  for (let f = BASE; f < WORK_TOP; f++) {
-    const t = (f - BASE) / (WORK_TOP - BASE);
+  for (let f = BASE; f < TOP; f++) {
+    const t = (f - BASE) / (TOP - BASE);
     const w = Math.round(18 - 9 * t);
     for (const dy of [16, 32]) {
       const x = Math.round((left ? 139 : 160) + rnd() * (21 - w));
@@ -134,10 +135,15 @@ function newGame(mode) {
     plats: buildPlatforms(),
     p: { x: 157, y: BASE * FH, vx: 0, vy: 0, face: 1, ground: true, coyote: 0, jumpBuf: 0,
          peak: BASE * FH, stun: 0, knock: 0, anim: 0, cab: null },
-    camY: BASE * FH - 12,
+    camY: BASE * FH - HUD_BOT - 4,
   };
   for (const i of ELEV) { nextRegime(i); S.el[i].v = S.el[i].target; }
+  S.year = 0; S.yearStart = S.el.map(e => e.off);
 }
+
+// Change of a column's price since the start of the year (height is log money).
+function yearPct(i) { return Math.pow(10, 4 / TOP * (S.el[i].off - S.yearStart[i]) / FH) - 1; }
+function fmtPct(x) { const v = Math.round(x * 100); return (v > 0 ? "+" : "") + v + "%"; }
 
 function nextRegime(i) {
   const c = COLS[i], e = S.el[i], m = MARKET[c.id];
@@ -204,6 +210,8 @@ function update(dt) {
     e.off += d;
     if (S.p.cab && S.p.cab.i === i) S.p.cab.floorY += d;
   }
+  const year = Math.min(44, Math.floor(S.t / YEAR));
+  if (year !== S.year) { S.year = year; S.yearStart = S.el.map(e => e.off); }
   for (const pl of S.plats) {
     if (pl.state === "shaking" && (pl.timer -= dt) <= 0) { pl.state = "gone"; pl.timer = 3; }
     else if (pl.state === "gone" && (pl.timer -= dt) <= 0) pl.state = "solid";
@@ -228,7 +236,7 @@ function update(dt) {
   S.toasts = S.toasts.filter(t => t.t > 0);
   if (S.banner && (S.banner.t -= dt) <= 0) S.banner = null;
   S.shake = Math.max(0, S.shake - dt);
-  const target = Math.min(Math.max(playerY() - 64, BASE * FH - 12), (TOP + 1) * FH + 40 - H);
+  const target = Math.min(Math.max(playerY() - 150, BASE * FH - HUD_BOT - 4), (TOP + 1) * FH + 40 - H);
   S.camY += (target - S.camY) * Math.min(1, dt * 6);
 }
 
@@ -489,24 +497,18 @@ function drawWorld() {
     for (let f = l.fmin; f < 0; f++) R(l.x, f * FH, l.w, FH - 4, "#38324a");
   // work column: bricks up to the career ceiling, then hallways
   const wc = COLS[WORK];
-  const brickTop = WORK_TOP * FH;
+  const brickTop = TOP * FH;
   R(wc.x, BASE * FH, wc.w, brickTop - BASE * FH, "#4a3b35");
   for (let by = Math.max(BASE * FH, Math.floor(y0 / 4) * 4); by < Math.min(brickTop, y1); by += 4) {
     R(wc.x, by, wc.w, 1, "#3b2e2a");
     for (let bx = wc.x + ((by / 4) % 2 ? 0 : 4); bx < wc.x + wc.w; bx += 8) R(bx, by + 1, 1, 3, "#3b2e2a");
   }
-  for (let f = WORK_TOP; f <= TOP; f++) {
-    R(wc.x, f * FH, wc.w, CAB_IN + 2, f === TOP ? "#7a6630" : "#5b5470");
-    R(wc.x, f * FH, wc.w, 10, f === TOP ? "#5e4e22" : "#4b4560");
-  }
+  R(wc.x, TOP * FH, wc.w, CAB_IN + 2, "#7a6630");
+  R(wc.x, TOP * FH, wc.w, 10, "#5e4e22");
   for (let f = BASE; f <= TOP; f++) {
     const ly = f * FH + 40;
-    if (ly < y0 - 10 || ly > y1 + 10 || f === WORK_TOP - 1) continue; // that spot holds the ceiling sign
+    if (ly < y0 - 10 || ly > y1 + 10) continue;
     text(fmtMoney(moneyAt(f * FH)), wc.x + wc.w / 2, Math.round(sy(ly)), "#8c7f9a", 1, "center");
-  }
-  if (brickTop > y0 && brickTop - 30 < y1) {
-    R(wc.x + 4, brickTop - 12, wc.w - 8, 9, "#20304a");
-    text("GLASS CEILING", wc.x + wc.w / 2, Math.round(sy(brickTop - 4)), "#9fd3ff", 1, "center");
   }
   // elevator shafts and cabins
   for (const i of ELEV) {
@@ -553,39 +555,50 @@ function drawWorld() {
 }
 
 function drawHud() {
-  ctx.fillStyle = "#0d0c18e6"; ctx.fillRect(0, 0, W, 9); ctx.fillRect(0, H - 8, W, 8);
+  ctx.fillStyle = "#0d0c18e6"; ctx.fillRect(0, 0, W, HUD_TOP); ctx.fillRect(0, H - HUD_BOT, W, HUD_BOT);
   const p = S.p, y = playerY();
   text(fmtMoney(moneyAt(y)), 3, 2, "#ffd34d");
-  const age = Math.floor(20 + 45 * Math.min(S.t, GAME_TIME) / GAME_TIME);
+  const ageF = 20 + 45 * Math.min(S.t, GAME_TIME) / GAME_TIME, age = Math.floor(ageF);
   text("AGE " + age, W - 3, 2, age >= 60 ? "#ff8a5c" : "#f2efe6", 1, "right");
   const zone = p.cab ? COLS[p.cab.i].title
     : p.x + PW > COLS[WORK].x && p.x < COLS[WORK].x + COLS[WORK].w ? (y < 0 ? "BASEMENT" : "WORK") : "HALLWAY";
   text(zone, W / 2, 2, "#b3a9bf", 1, "center");
+  // age gauge: one cell per year from 20 to 65, the current year highlighted
+  const a0 = 14, a1 = W - 14, cell = (a1 - a0) / 45;
+  text("20", a0 - 2, 10, "#8c7f9a", 1, "right"); text("65", a1 + 2, 10, "#8c7f9a");
+  ctx.fillStyle = "#26223a"; ctx.fillRect(a0, 11, a1 - a0, 4);
+  ctx.fillStyle = "#6d6684"; ctx.fillRect(a0, 11, Math.round((ageF - 20) * cell), 4);
+  ctx.fillStyle = "#ffd34d"; ctx.fillRect(Math.round(a0 + (age - 20) * cell), 10, Math.max(2, Math.round(cell)), 6);
+  ctx.fillStyle = "#0d0c18";
+  for (let n = 5; n < 45; n += 5) ctx.fillRect(Math.round(a0 + n * cell), 11, 1, 4);
+  // columns: trend arrow and change since the start of the year
   for (let i = 0; i < COLS.length; i++) {
     const c = COLS[i], cx = c.x + c.w / 2;
-    text(c.name, cx, H - 6, c.light || "#c89656", 1, "center");
+    text(c.name, cx, H - 14, c.light || "#c89656", 1, "center");
     if (i === WORK) continue;
     const v = S.el[i].v, x = cx + textWidth(c.name) / 2 + 3;
     ctx.fillStyle = v >= 0 ? "#5fd36a" : "#ff5a4f";
     for (let r = 0; r < 3; r++) {
       const half = v >= 0 ? r : 2 - r; // up: widens downwards; down: narrows downwards
-      ctx.fillRect(x + 2 - half, H - 5 + r, 1 + 2 * half, 1);
+      ctx.fillRect(x + 2 - half, H - 13 + r, 1 + 2 * half, 1);
     }
+    const pct = yearPct(i);
+    text(fmtPct(pct), cx, H - 7, pct >= 0 ? "#5fd36a" : "#ff5a4f", 1, "center");
   }
   // wealth gauge on the right facade
-  const g0 = 14, g1 = H - 12, frac = (y / FH - BASE) / (TOP - BASE);
+  const g0 = HUD_TOP + 6, g1 = H - HUD_BOT - 6, frac = (y / FH - BASE) / (TOP - BASE);
   ctx.fillStyle = "#0d0c18"; ctx.fillRect(312, g0, 4, g1 - g0);
   for (const f of [0, 7.5, 15, 22.5, 30]) {
     ctx.fillStyle = "#8c7f9a"; ctx.fillRect(310, Math.round(g1 - (f - BASE) / (TOP - BASE) * (g1 - g0)), 2, 1);
   }
   ctx.fillStyle = "#ffd34d";
   ctx.fillRect(312, Math.round(g1 - Math.max(0, Math.min(1, frac)) * (g1 - g0)) - 1, 4, 2);
-  if (S.banner && Math.floor(S.banner.t * 6) % 2) shadowText(S.banner.text, W / 2, 30, S.banner.color, 2, "center");
+  if (S.banner && Math.floor(S.banner.t * 6) % 2) shadowText(S.banner.text, W / 2, 60, S.banner.color, 2, "center");
 }
 
 function panel(lines) {
   ctx.fillStyle = "#07060dd9"; ctx.fillRect(0, 0, W, H);
-  let y = 28;
+  let y = H / 2 - 70;
   for (const [s, color, k] of lines) {
     if (s) shadowText(s, W / 2, y, color, k, "center");
     y += k === 2 ? 18 : 9;
